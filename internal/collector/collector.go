@@ -1,14 +1,19 @@
 package collector
 
 import (
+	"context"
 	"database/sql"
+	"log"
+	"sync"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 )
 
 // NewsLabCollector는 NewsLab DB를 읽어 Prometheus 지표로 변환한다.
 type NewsLabCollector struct {
-	db *sql.DB
+	db            *sql.DB
+	scrapeTimeout time.Duration
 
 	articlesCollected *prometheus.Desc
 	articlesSkipped   *prometheus.Desc
@@ -33,9 +38,10 @@ type NewsLabCollector struct {
 }
 
 // New는 collector를 만들고 지표 설계도를 미리 준비한다.
-func New(db *sql.DB) *NewsLabCollector {
+func New(db *sql.DB, scrapeTimeout time.Duration) *NewsLabCollector {
 	return &NewsLabCollector{
-		db: db,
+		db:            db,
+		scrapeTimeout: scrapeTimeout,
 
 		articlesCollected: prometheus.NewDesc(
 			"newslab_articles_collected_total",
@@ -134,19 +140,38 @@ func (c *NewsLabCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.querySuccess
 }
 
-// Collect는 scrape 요청마다 호출된다. DB를 조회해 현재 값을 내보낸다.
+// Collect는 scrape 요청마다 호출된다.
+// 쿼리 7개를 동시에 실행하되, 하나가 실패해도 나머지 지표는 그대로 내보낸다.
 func (c *NewsLabCollector) Collect(ch chan<- prometheus.Metric) {
-	c.collectCrawlRuns(ch)
-	c.collectStoredCounts(ch)
-	c.collectPipelineRuns(ch)
-	c.collectPipelineLastSuccess(ch)
-	c.collectPipelineEmbeddings(ch)
-	c.collectPipelineTopics(ch)
-	c.collectExtractionItems(ch)
+	ctx, cancel := context.WithTimeout(context.Background(), c.scrapeTimeout)
+	defer cancel()
+
+	collectors := []func(context.Context, chan<- prometheus.Metric){
+		c.collectCrawlRuns,
+		c.collectStoredCounts,
+		c.collectPipelineRuns,
+		c.collectPipelineLastSuccess,
+		c.collectPipelineEmbeddings,
+		c.collectPipelineTopics,
+		c.collectExtractionItems,
+	}
+
+	var wg sync.WaitGroup
+
+	for _, collect := range collectors {
+		wg.Add(1)
+
+		go func() {
+			defer wg.Done()
+			collect(ctx, ch)
+		}()
+	}
+
+	wg.Wait()
 }
 
 // collectCrawlRuns는 crawl_runs에서 수집·스킵 누적 건수를 읽는다.
-func (c *NewsLabCollector) collectCrawlRuns(ch chan<- prometheus.Metric) {
+func (c *NewsLabCollector) collectCrawlRuns(ctx context.Context, ch chan<- prometheus.Metric) {
 	const query = `
 		select
 			coalesce(sum(inserted_count), 0),
@@ -157,12 +182,10 @@ func (c *NewsLabCollector) collectCrawlRuns(ch chan<- prometheus.Metric) {
 	var collected float64
 	var skipped float64
 
-	row := c.db.QueryRow(query)
+	row := c.db.QueryRowContext(ctx, query)
 	err := row.Scan(&collected, &skipped)
 	if err != nil {
-		ch <- prometheus.MustNewConstMetric(
-			c.querySuccess, prometheus.GaugeValue, 0, "crawl_runs",
-		)
+		c.reportQueryFailure(ch, "crawl_runs", err)
 		return
 	}
 
@@ -178,7 +201,7 @@ func (c *NewsLabCollector) collectCrawlRuns(ch chan<- prometheus.Metric) {
 }
 
 // collectPipelineRuns는 파이프라인별·상태별 실행 횟수를 읽는다.
-func (c *NewsLabCollector) collectPipelineRuns(ch chan<- prometheus.Metric) {
+func (c *NewsLabCollector) collectPipelineRuns(ctx context.Context, ch chan<- prometheus.Metric) {
 	const query = `
 		select 'rss_collector' as pipeline, status, count(*) from crawl_runs group by status
 		union all
@@ -189,11 +212,9 @@ func (c *NewsLabCollector) collectPipelineRuns(ch chan<- prometheus.Metric) {
 		select 'weekly', status, count(*) from weekly_topic_runs group by status
 	`
 
-	rows, err := c.db.Query(query)
+	rows, err := c.db.QueryContext(ctx, query)
 	if err != nil {
-		ch <- prometheus.MustNewConstMetric(
-			c.querySuccess, prometheus.GaugeValue, 0, "pipeline_runs",
-		)
+		c.reportQueryFailure(ch, "pipeline_runs", err)
 		return
 	}
 	defer rows.Close()
@@ -205,9 +226,7 @@ func (c *NewsLabCollector) collectPipelineRuns(ch chan<- prometheus.Metric) {
 
 		err := rows.Scan(&pipeline, &status, &runs)
 		if err != nil {
-			ch <- prometheus.MustNewConstMetric(
-				c.querySuccess, prometheus.GaugeValue, 0, "pipeline_runs",
-			)
+			c.reportQueryFailure(ch, "pipeline_runs", err)
 			return
 		}
 
@@ -218,9 +237,7 @@ func (c *NewsLabCollector) collectPipelineRuns(ch chan<- prometheus.Metric) {
 
 	err = rows.Err()
 	if err != nil {
-		ch <- prometheus.MustNewConstMetric(
-			c.querySuccess, prometheus.GaugeValue, 0, "pipeline_runs",
-		)
+		c.reportQueryFailure(ch, "pipeline_runs", err)
 		return
 	}
 
@@ -230,7 +247,7 @@ func (c *NewsLabCollector) collectPipelineRuns(ch chan<- prometheus.Metric) {
 }
 
 // collectStoredCounts는 현재 저장된 기사와 임베딩 수를 읽는다.
-func (c *NewsLabCollector) collectStoredCounts(ch chan<- prometheus.Metric) {
+func (c *NewsLabCollector) collectStoredCounts(ctx context.Context, ch chan<- prometheus.Metric) {
 	const query = `
 		select
 			(select count(*) from articles),
@@ -240,10 +257,10 @@ func (c *NewsLabCollector) collectStoredCounts(ch chan<- prometheus.Metric) {
 	var articles float64
 	var embeddings float64
 
-	row := c.db.QueryRow(query)
+	row := c.db.QueryRowContext(ctx, query)
 	err := row.Scan(&articles, &embeddings)
 	if err != nil {
-		ch <- prometheus.MustNewConstMetric(c.querySuccess, prometheus.GaugeValue, 0, "stored_counts")
+		c.reportQueryFailure(ch, "stored_counts", err)
 		return
 	}
 
@@ -254,7 +271,7 @@ func (c *NewsLabCollector) collectStoredCounts(ch chan<- prometheus.Metric) {
 
 // collectPipelineLastSuccess는 파이프라인별 마지막 성공 시각을 읽는다.
 // 한 번도 성공한 적이 없으면 지표를 내보내지 않는다. 0을 내보내면 1970년으로 표시되기 때문이다.
-func (c *NewsLabCollector) collectPipelineLastSuccess(ch chan<- prometheus.Metric) {
+func (c *NewsLabCollector) collectPipelineLastSuccess(ctx context.Context, ch chan<- prometheus.Metric) {
 	const query = `
 		select 'rss_collector' as pipeline, extract(epoch from max(finished_at))
 		from crawl_runs where status = 'success'
@@ -269,9 +286,9 @@ func (c *NewsLabCollector) collectPipelineLastSuccess(ch chan<- prometheus.Metri
 		from weekly_topic_runs where status = 'success'
 	`
 
-	rows, err := c.db.Query(query)
+	rows, err := c.db.QueryContext(ctx, query)
 	if err != nil {
-		ch <- prometheus.MustNewConstMetric(c.querySuccess, prometheus.GaugeValue, 0, "last_success")
+		c.reportQueryFailure(ch, "last_success", err)
 		return
 	}
 	defer rows.Close()
@@ -282,7 +299,7 @@ func (c *NewsLabCollector) collectPipelineLastSuccess(ch chan<- prometheus.Metri
 
 		err := rows.Scan(&pipeline, &epoch)
 		if err != nil {
-			ch <- prometheus.MustNewConstMetric(c.querySuccess, prometheus.GaugeValue, 0, "last_success")
+			c.reportQueryFailure(ch, "last_success", err)
 			return
 		}
 
@@ -297,7 +314,7 @@ func (c *NewsLabCollector) collectPipelineLastSuccess(ch chan<- prometheus.Metri
 
 	err = rows.Err()
 	if err != nil {
-		ch <- prometheus.MustNewConstMetric(c.querySuccess, prometheus.GaugeValue, 0, "last_success")
+		c.reportQueryFailure(ch, "last_success", err)
 		return
 	}
 
@@ -305,7 +322,7 @@ func (c *NewsLabCollector) collectPipelineLastSuccess(ch chan<- prometheus.Metri
 }
 
 // collectPipelineEmbeddings는 파이프라인별 임베딩 후보·재사용·미보유 건수를 읽는다.
-func (c *NewsLabCollector) collectPipelineEmbeddings(ch chan<- prometheus.Metric) {
+func (c *NewsLabCollector) collectPipelineEmbeddings(ctx context.Context, ch chan<- prometheus.Metric) {
 	const query = `
 		select 'three_day' as pipeline,
 			coalesce(sum(candidate_count), 0),
@@ -320,9 +337,9 @@ func (c *NewsLabCollector) collectPipelineEmbeddings(ch chan<- prometheus.Metric
 		from weekly_topic_runs
 	`
 
-	rows, err := c.db.Query(query)
+	rows, err := c.db.QueryContext(ctx, query)
 	if err != nil {
-		ch <- prometheus.MustNewConstMetric(c.querySuccess, prometheus.GaugeValue, 0, "pipeline_embeddings")
+		c.reportQueryFailure(ch, "pipeline_embeddings", err)
 		return
 	}
 	defer rows.Close()
@@ -335,7 +352,7 @@ func (c *NewsLabCollector) collectPipelineEmbeddings(ch chan<- prometheus.Metric
 
 		err := rows.Scan(&pipeline, &candidates, &reused, &missing)
 		if err != nil {
-			ch <- prometheus.MustNewConstMetric(c.querySuccess, prometheus.GaugeValue, 0, "pipeline_embeddings")
+			c.reportQueryFailure(ch, "pipeline_embeddings", err)
 			return
 		}
 
@@ -346,7 +363,7 @@ func (c *NewsLabCollector) collectPipelineEmbeddings(ch chan<- prometheus.Metric
 
 	err = rows.Err()
 	if err != nil {
-		ch <- prometheus.MustNewConstMetric(c.querySuccess, prometheus.GaugeValue, 0, "pipeline_embeddings")
+		c.reportQueryFailure(ch, "pipeline_embeddings", err)
 		return
 	}
 
@@ -354,7 +371,7 @@ func (c *NewsLabCollector) collectPipelineEmbeddings(ch chan<- prometheus.Metric
 }
 
 // collectPipelineTopics는 파이프라인별 토픽 선정·저장·실패 수를 읽는다.
-func (c *NewsLabCollector) collectPipelineTopics(ch chan<- prometheus.Metric) {
+func (c *NewsLabCollector) collectPipelineTopics(ctx context.Context, ch chan<- prometheus.Metric) {
 	const query = `
 		select 'three_day' as pipeline,
 			coalesce(sum(selected_topic_count), 0),
@@ -369,9 +386,9 @@ func (c *NewsLabCollector) collectPipelineTopics(ch chan<- prometheus.Metric) {
 		from weekly_topic_runs
 	`
 
-	rows, err := c.db.Query(query)
+	rows, err := c.db.QueryContext(ctx, query)
 	if err != nil {
-		ch <- prometheus.MustNewConstMetric(c.querySuccess, prometheus.GaugeValue, 0, "pipeline_topics")
+		c.reportQueryFailure(ch, "pipeline_topics", err)
 		return
 	}
 	defer rows.Close()
@@ -384,7 +401,7 @@ func (c *NewsLabCollector) collectPipelineTopics(ch chan<- prometheus.Metric) {
 
 		err := rows.Scan(&pipeline, &selected, &saved, &failed)
 		if err != nil {
-			ch <- prometheus.MustNewConstMetric(c.querySuccess, prometheus.GaugeValue, 0, "pipeline_topics")
+			c.reportQueryFailure(ch, "pipeline_topics", err)
 			return
 		}
 
@@ -395,7 +412,7 @@ func (c *NewsLabCollector) collectPipelineTopics(ch chan<- prometheus.Metric) {
 
 	err = rows.Err()
 	if err != nil {
-		ch <- prometheus.MustNewConstMetric(c.querySuccess, prometheus.GaugeValue, 0, "pipeline_topics")
+		c.reportQueryFailure(ch, "pipeline_topics", err)
 		return
 	}
 
@@ -405,7 +422,7 @@ func (c *NewsLabCollector) collectPipelineTopics(ch chan<- prometheus.Metric) {
 // collectExtractionItems는 원문 추출의 성공·실패 건수를 읽는다.
 // extraction_runs는 항목이 실패해도 run status를 success로 기록하므로
 // 실패 건수를 별도 지표로 노출해야 한다.
-func (c *NewsLabCollector) collectExtractionItems(ch chan<- prometheus.Metric) {
+func (c *NewsLabCollector) collectExtractionItems(ctx context.Context, ch chan<- prometheus.Metric) {
 	const query = `
 		select
 			coalesce(sum(success_count), 0),
@@ -416,14 +433,24 @@ func (c *NewsLabCollector) collectExtractionItems(ch chan<- prometheus.Metric) {
 	var processed float64
 	var failed float64
 
-	row := c.db.QueryRow(query)
+	row := c.db.QueryRowContext(ctx, query)
 	err := row.Scan(&processed, &failed)
 	if err != nil {
-		ch <- prometheus.MustNewConstMetric(c.querySuccess, prometheus.GaugeValue, 0, "extraction_items")
+		c.reportQueryFailure(ch, "extraction_items", err)
 		return
 	}
 
 	ch <- prometheus.MustNewConstMetric(c.itemsProcessed, prometheus.CounterValue, processed, "extraction")
 	ch <- prometheus.MustNewConstMetric(c.itemsFailed, prometheus.CounterValue, failed, "extraction")
 	ch <- prometheus.MustNewConstMetric(c.querySuccess, prometheus.GaugeValue, 1, "extraction_items")
+}
+
+// reportQueryFailure는 쿼리 실패를 로그로 남기고 query_success=0을 내보낸다.
+// query_success만으로는 실패 원인을 알 수 없기 때문이다.
+func (c *NewsLabCollector) reportQueryFailure(ch chan<- prometheus.Metric, query string, err error) {
+	log.Printf("collector query failed: query=%s err=%v", query, err)
+
+	ch <- prometheus.MustNewConstMetric(
+		c.querySuccess, prometheus.GaugeValue, 0, query,
+	)
 }
