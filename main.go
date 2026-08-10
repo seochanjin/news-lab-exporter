@@ -10,6 +10,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/seochanjin/news-lab-exporter/internal/collector"
 	"github.com/seochanjin/news-lab-exporter/internal/config"
 )
 
@@ -35,6 +36,11 @@ func main() {
 		Name: "newslab_exporter_build_info",
 		Help: "Exporter build info. Always 1.",
 	})
+
+	newslabCollector := collector.New(db)
+
+	prometheus.MustRegister(newslabCollector)
+
 	buildInfo.Set(1)
 
 	http.Handle(cfg.MetricsPath, promhttp.Handler())
