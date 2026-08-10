@@ -482,19 +482,46 @@ extraction_runs는 3day/weekly와 상태 판정 규칙이 다르다.
 | `newslab_pipeline_topics_failed_total` | Counter | `pipeline` | `sum(failed_topic_count)` | ⑥ |
 | `newslab_pipeline_items_processed_total` | Counter | `pipeline` | `sum(extraction_runs.success_count)` | ⑤ |
 | `newslab_pipeline_items_failed_total` | Counter | `pipeline` | `sum(extraction_runs.failed_count)` | ⑥ |
-| `newslab_exporter_scrape_error_total` | Counter | `query` | exporter 자체 | — |
+| `newslab_exporter_query_success` | Gauge | `query` | exporter 자체 | — |
 
-**쿼리 6개**: crawl / articles+embeddings / pipeline-embedding / pipeline-runs / pipeline-topics / extraction
-→ `errgroup`으로 동시 실행한다.
+**Status: 2026-08-10 UNIT-03에서 15종 전부 구현·확인 완료.**
+
+**쿼리 7개**: `crawl_runs` / `stored_counts` / `pipeline_runs` / `last_success` /
+`pipeline_embeddings` / `pipeline_topics` / `extraction_items`
+→ 현재 순차 실행. `errgroup` 동시 실행은 UNIT-03c에서 적용한다.
 
 `pipeline` label 값: `rss_collector`, `extraction`, `three_day`, `weekly`
 (daily는 run table 부재로 제외)
 
+## 구현 중 변경한 계약
+
+**`newslab_exporter_scrape_error_total` (Counter) → `newslab_exporter_query_success` (Gauge)**
+
+Counter는 값을 누적해 기억해야 한다. 그러나 `prometheus.Collector`는 scrape마다 값을
+만들고 버리는 무상태 구조라, 상태를 유지하려면 뮤텍스와 별도 registry가 필요하다.
+
+대신 `node_exporter`의 `node_scrape_collector_success`와 같은 형태를 택했다.
+
+```
+newslab_exporter_query_success{query="pipeline_runs"} 1    # 성공
+newslab_exporter_query_success{query="pipeline_runs"} 0    # 실패
+```
+
+무상태로 구현되고 알림 규칙도 단순하다(`== 0`).
+**"실패를 0으로 덮지 않는다"는 원칙은 그대로다** — 실패한 쿼리의 업무 지표 자체를
+내보내지 않고, 실패 사실만 이 지표로 알린다.
+
 ## 공통 규칙
 
 - 조회 실패를 `0`으로 덮지 않는다. 해당 지표를 노출하지 않고
-  `newslab_exporter_scrape_error_total{query}`를 올린다.
+  `newslab_exporter_query_success{query}`를 `0`으로 내보낸다.
   (`news-lab` Grafana dashboard에서 `or vector(0)`을 거부한 판단과 같은 원칙)
+- **반복문이 정상 종료된 것과 성공한 것은 다르다.** `for rows.Next()` 뒤에
+  반드시 `rows.Err()`를 확인한다. 확인하지 않으면 중간에 끊긴 조회를 성공으로
+  기록하게 되는데, 이는 이 exporter가 드러내려는 `extraction_runs`의 문제와 같은 패턴이다.
+- **값이 없으면 지표를 내보내지 않는다.** `last_success`가 없는 파이프라인에 `0`을
+  내보내면 1970-01-01로 표시되어 "오래됨"과 "한 번도 성공 안 함"을 구분할 수 없다.
+  `sql.NullFloat64`로 NULL과 0을 구분한다.
 - 누적값은 `prometheus.NewConstMetric(..., prometheus.CounterValue, ...)`로 노출한다.
   run table이 append-only임을 0-4에서 확인했다.
 - label에 `article_id`, `topic_id`, URL 등 고유값을 넣지 않는다.
@@ -507,7 +534,7 @@ extraction_runs는 3day/weekly와 상태 판정 규칙이 다르다.
 
 | # | 발견 | 성격 | 조치 |
 | --- | --- | --- | --- |
-| 1 | three_day 최근 2회(8/8, 8/9) `partial_success`. Job은 초록불 | 운영 | exporter가 노출하면 즉시 보임 |
+| 1 | three_day 최근 2회(8/8, 8/9) `partial_success`. Job은 초록불 | 운영 | **8/10에 3연속으로 확대 확인. 아래 참조** |
 | 2 | **extraction_runs 252회 전부 `success`인데 실패 47건.** 파이프라인마다 상태 판정 규칙이 다름 | 설계 결함 후보 | `items_failed_total` 별도 노출. 어휘 통일은 후속 |
 | 3 | 임베딩 커버리지 73.3%의 82%가 6월 백필 부채. 정상 운영은 92%, 나머지 8%는 발행 지연으로 설계상 제외 | 구조 | 6월 백필 검토 (아래) |
 | 4 | `articles` 9,629 vs `inserted_count` 9,613 = crawl_runs 도입 전 16건 | 계측 | 두 지표 모두 노출 |
@@ -515,6 +542,56 @@ extraction_runs는 3day/weekly와 상태 판정 규칙이 다르다.
 | 6 | 원문 추출 657/9,629 = 6.8% ≈ 이력서 7.4% | 검증됨 | 이력서 근거 |
 | 7 | run table 3종 append-only → Counter 안전 | 확정 | — |
 | 8 | 이력서 수집 수치가 낡음 (6,300 → 9,613) | — | **이력서 갱신 필요** |
+
+## 2026-08-10 — exporter 가동 후 실시간 확인 ★
+
+UNIT-03 완료 직후 `/metrics` 실측값을 8/9 조사값과 대조했다.
+**만 하루 만에 발견 1·2가 회고가 아니라 진행 중인 문제임이 드러났다.**
+
+| 지표 | 8/9 조사 | 8/10 실측 | 변화 |
+| --- | --- | --- | --- |
+| `articles_collected_total` | 9,613 | 9,750 | +137 |
+| `articles_stored` | 9,629 | 9,766 | +137 |
+| `article_embeddings_stored` | 7,061 | 7,176 | +115 |
+| `pipeline_runs{three_day,partial_success}` | 17 | **18** | **+1** |
+| `pipeline_runs{three_day,success}` | 32 | **32** | **0** |
+| `pipeline_runs{weekly,partial_success}` | 1 | **2** | **+1** |
+| `pipeline_runs{weekly,success}` | 8 | **8** | **0** |
+| `topics_failed{three_day}` | 19 | 21 | +2 |
+| `items_failed{extraction}` | 47 | **50** | +3 |
+
+### 마지막 성공 시각 정체
+
+| 파이프라인 | 마지막 `success` | 정체 |
+| --- | --- | --- |
+| `three_day` | 2026-08-07 05:06 KST | **82.8시간 (3.5일)** |
+| `weekly` | 2026-08-03 00:38 KST | **183시간 (7.6일)** |
+
+- `three_day`는 8/8·8/9·8/10 **3연속 `partial_success`**. 매일 정시에 실행되지만
+  완전히 성공하지 못하고 있다. `success` 카운트가 32에서 멈춰 있다.
+- `weekly`는 8/10(월) 실행분도 `partial_success`. `success`가 8에서 늘지 않았다.
+- `extraction`의 실패 항목은 47 → 50으로 계속 쌓이는데 run status는 여전히 전부 `success`.
+
+**이 세 가지가 모두 Kubernetes Job에서는 초록불이다.**
+kube-state-metrics 기반 기존 대시보드로는 지금도 정상으로 보인다.
+
+### 알림 규칙 근거 확보
+
+`last_success_timestamp`가 생겨 신선도 SLO를 정의할 수 있게 됐다.
+
+```promql
+time() - newslab_pipeline_last_success_timestamp_seconds{pipeline="three_day"} > 26*3600
+```
+
+현재 값 기준으로 즉시 발화한다. 로드맵 Week 1의 "신선도 SLO"가 이 지표 위에 올라간다.
+threshold와 `for` 기간은 `news-lab` 저장소의 알림 Task에서 확정한다.
+
+### 후속 확인 항목
+
+- `rss_collector` 마지막 성공이 8/10 15:53 KST로 기록됐다. CronJob 스케줄은 03:00 KST다.
+  수동 실행 또는 다른 실행 경로가 있는지 확인이 필요하다.
+- `three_day` 3연속 `partial_success`의 원인 조사 — `failed_topic_count`가 왜 발생하는지.
+  **exporter 범위가 아니라 `news-lab` 파이프라인 조사 대상이다.**
 
 ## 6월 임베딩 백필 검토
 

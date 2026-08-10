@@ -264,7 +264,7 @@ git grep -n -i -E "DATABASE_URL=|password|api[_-]?key|token" -- ':!docs/**'
 
 - [x] UNIT-01 Go 뼈대와 `/metrics` 하드코딩
 - [x] UNIT-02 설정과 DB 연결 (read-only)
-- [ ] UNIT-03 Collector 구현과 쿼리 6개
+- [x] UNIT-03 Collector 구현과 쿼리 7개 (errgroup 미적용)
 - [ ] UNIT-04 테스트
 - [ ] UNIT-05 컨테이너화와 이미지 크기 측정
 - [ ] UNIT-06 Kubernetes manifest

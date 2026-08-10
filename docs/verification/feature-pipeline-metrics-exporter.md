@@ -4,7 +4,7 @@
 
 pending
 
-UNIT-01, UNIT-02 완료. UNIT-03~07 미수행.
+UNIT-01, UNIT-02, UNIT-03(errgroup 제외) 완료. UNIT-04~07 미수행.
 
 ## 환경
 
@@ -137,9 +137,128 @@ cannot parse `postgresql+psycopg://...`: failed to parse as keyword/value (inval
 
 ---
 
+---
+
+## UNIT-03. Collector 구현과 쿼리 7개
+
+### 구현 범위
+
+- `internal/collector/collector.go` — `prometheus.Collector` 인터페이스 직접 구현
+- `Describe()` / `Collect()` 두 메서드로 인터페이스 충족 (`implements` 선언 없음)
+- 지표 15종, 쿼리 7개
+- `main.go`에서 `prometheus.MustRegister(newslabCollector)`로 등록
+
+### 지표 노출 확인
+
+Command:
+
+```bash
+go mod tidy
+set -a; source .env; set +a
+go run .
+curl -s localhost:9310/metrics | grep '^newslab' | sort
+```
+
+Result:
+
+```text
+newslab_article_embeddings_stored 7176
+newslab_articles_collected_total 9750
+newslab_articles_skipped_total 3966
+newslab_articles_stored 9766
+newslab_exporter_build_info 1
+newslab_exporter_query_success{query="crawl_runs"} 1
+newslab_exporter_query_success{query="extraction_items"} 1
+newslab_exporter_query_success{query="last_success"} 1
+newslab_exporter_query_success{query="pipeline_embeddings"} 1
+newslab_exporter_query_success{query="pipeline_runs"} 1
+newslab_exporter_query_success{query="pipeline_topics"} 1
+newslab_exporter_query_success{query="stored_counts"} 1
+newslab_pipeline_embedding_candidates_total{pipeline="three_day"} 21075
+newslab_pipeline_embedding_candidates_total{pipeline="weekly"} 9752
+newslab_pipeline_embedding_missing_total{pipeline="three_day"} 612
+newslab_pipeline_embedding_missing_total{pipeline="weekly"} 1794
+newslab_pipeline_embedding_reused_total{pipeline="three_day"} 20463
+newslab_pipeline_embedding_reused_total{pipeline="weekly"} 7958
+newslab_pipeline_items_failed_total{pipeline="extraction"} 50
+newslab_pipeline_items_processed_total{pipeline="extraction"} 671
+newslab_pipeline_last_success_timestamp_seconds{pipeline="extraction"} 1.786345632214171e+09
+newslab_pipeline_last_success_timestamp_seconds{pipeline="rss_collector"} 1.786344836385017e+09
+newslab_pipeline_last_success_timestamp_seconds{pipeline="three_day"} 1.786046774298005e+09
+newslab_pipeline_last_success_timestamp_seconds{pipeline="weekly"} 1.785685096817905e+09
+newslab_pipeline_runs_total{pipeline="extraction",status="success"} 260
+newslab_pipeline_runs_total{pipeline="rss_collector",status="success"} 74
+newslab_pipeline_runs_total{pipeline="three_day",status="partial_success"} 18
+newslab_pipeline_runs_total{pipeline="three_day",status="success"} 32
+newslab_pipeline_runs_total{pipeline="weekly",status="partial_success"} 2
+newslab_pipeline_runs_total{pipeline="weekly",status="success"} 8
+newslab_pipeline_topics_failed_total{pipeline="three_day"} 21
+newslab_pipeline_topics_failed_total{pipeline="weekly"} 3
+newslab_pipeline_topics_saved_total{pipeline="three_day"} 229
+newslab_pipeline_topics_saved_total{pipeline="weekly"} 41
+newslab_pipeline_topics_selected_total{pipeline="three_day"} 250
+newslab_pipeline_topics_selected_total{pipeline="weekly"} 44
+```
+
+Status: passed
+
+### 계약 대조
+
+| 항목 | 결과 |
+| --- | --- |
+| 지표 15종 전부 노출 | passed |
+| `pipeline` label에 `daily` 없음 | passed |
+| `status` label 하드코딩 없음 (DB `group by` 결과 사용) | passed |
+| 비율 계산 없이 원자값만 노출 | passed |
+| 고유값(`article_id` 등) label 없음 | passed |
+| `query_success` 7개 전부 `1` | passed |
+| 값이 `docs/design/metrics.md` 조사값과 정합 | passed (아래) |
+
+### 조사값과의 정합성
+
+8/9 `psql` 조사값 대비 8/10 실측값이 모두 증가 방향으로만 변화했다.
+감소한 지표는 없다. Counter 단조증가 전제가 유지됨을 확인했다.
+
+| 지표 | 8/9 조사 | 8/10 실측 |
+| --- | --- | --- |
+| `articles_collected_total` | 9,613 | 9,750 |
+| `articles_stored` | 9,629 | 9,766 |
+| `article_embeddings_stored` | 7,061 | 7,176 |
+| `pipeline_runs{three_day,partial_success}` | 17 | 18 |
+| `pipeline_runs{three_day,success}` | 32 | 32 |
+| `items_failed{extraction}` | 47 | 50 |
+
+### 구현 중 수정한 결함
+
+**`rows.Err()` 미확인**
+
+최초 구현에서 `for rows.Next()` 반복 후 `rows.Err()`를 확인하지 않았다.
+반복 중간에 조회가 끊기면 `rows.Next()`가 `false`를 반환하며 루프가 정상 종료된 것처럼
+빠져나오고, 부분 데이터를 받은 상태로 `query_success = 1`을 내보내게 된다.
+
+**이는 이 exporter가 드러내려는 `extraction_runs`의 문제와 동일한 패턴이다.**
+항목이 실패해도 전체를 성공으로 기록하는 것.
+
+조치: 모든 다중 행 조회 함수에서 반복 후 `rows.Err()`를 확인하고,
+오류가 있으면 `query_success = 0`을 내보내도록 수정했다.
+
+### 계약 변경
+
+`newslab_exporter_scrape_error_total` (Counter) → `newslab_exporter_query_success` (Gauge).
+근거는 `docs/design/metrics.md`의 "구현 중 변경한 계약" 절에 기록했다.
+
+### 미확인 항목
+
+- **read-only 동작의 실제 거부는 여전히 미검증이다.** 이번 UNIT의 쿼리가 모두 `select`라
+  쓰기 거부를 확인할 기회가 없었다. UNIT-04 테스트에서 다룬다.
+- `errgroup` 동시 실행 미적용. 현재 쿼리 7개는 순차 실행된다.
+- `gofmt` / `go vet` / `go test` 미실행.
+
+---
+
 ## 미수행
 
-- UNIT-03 Collector 구현과 쿼리 6개
+- UNIT-03c `errgroup` 동시 실행
 - UNIT-04 테스트
 - UNIT-05 컨테이너화, 이미지 크기 측정
 - UNIT-06 Kubernetes manifest
