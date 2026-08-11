@@ -4,7 +4,7 @@
 
 pending
 
-UNIT-01, UNIT-02, UNIT-03(errgroup 제외) 완료. UNIT-04~07 미수행.
+UNIT-01 ~ UNIT-04 완료. UNIT-05~07 미수행.
 
 ## 환경
 
@@ -137,8 +137,6 @@ cannot parse `postgresql+psycopg://...`: failed to parse as keyword/value (inval
 
 ---
 
----
-
 ## UNIT-03. Collector 구현과 쿼리 7개
 
 ### 구현 범위
@@ -247,25 +245,185 @@ Status: passed
 `newslab_exporter_scrape_error_total` (Counter) → `newslab_exporter_query_success` (Gauge).
 근거는 `docs/design/metrics.md`의 "구현 중 변경한 계약" 절에 기록했다.
 
-### 미확인 항목
+### 이 시점의 미확인 항목
 
-- **read-only 동작의 실제 거부는 여전히 미검증이다.** 이번 UNIT의 쿼리가 모두 `select`라
-  쓰기 거부를 확인할 기회가 없었다. UNIT-04 테스트에서 다룬다.
-- `errgroup` 동시 실행 미적용. 현재 쿼리 7개는 순차 실행된다.
-- `gofmt` / `go vet` / `go test` 미실행.
+- **read-only 동작의 실제 거부는 미검증.** 이번 UNIT의 쿼리가 모두 `select`라
+  쓰기 거부를 확인할 기회가 없었다.
+- 쿼리 7개는 순차 실행된다. 동시 실행은 UNIT-03c에서 적용했다.
+- `gofmt` / `go vet` / `go test` 미실행. UNIT-04에서 수행했다.
+
+---
+
+## UNIT-03c. 쿼리 동시 실행
+
+### 구현 범위
+
+- `Collect()`에서 쿼리 7개를 `sync.WaitGroup`으로 동시 실행
+- `context.WithTimeout(cfg.ScrapeTimeout)` 적용, 전 조회를 `QueryContext`/`QueryRowContext`로 전환
+- `reportQueryFailure` 헬퍼로 실패 시 로그 기록
+
+### 계약 변경 — `errgroup` → `sync.WaitGroup`
+
+Task 문서는 `errgroup`을 명시했으나 구현 단계에서 `sync.WaitGroup`으로 변경했다.
+
+| `errgroup` 기능 | 이 프로젝트에 필요한가 |
+| --- | --- |
+| 에러 전파 | 불필요. 각 함수가 `query_success=0`으로 자체 처리 |
+| `WithContext` (하나 실패 시 나머지 취소) | **요구와 반대.** 하나가 실패해도 나머지 지표는 나와야 한다 |
+| `SetLimit` | 불필요 (7개 고정) |
+
+에러를 전파하지 않는데 `errgroup`을 쓰면 전 함수가 `return nil`만 하게 된다.
+필요해서가 아니라 관례로 쓰는 것이 되므로 `sync.WaitGroup`을 택했다.
+
+### 동시 실행 도입 직후 발생한 장애 ★
+
+Command:
+
+```bash
+go run .
+curl -s localhost:9310/metrics | grep query_success
+```
+
+Result (1차):
+
+```text
+newslab_exporter_query_success{query="crawl_runs"} 0
+newslab_exporter_query_success{query="extraction_items"} 0
+newslab_exporter_query_success{query="last_success"} 0
+newslab_exporter_query_success{query="pipeline_embeddings"} 1
+newslab_exporter_query_success{query="pipeline_runs"} 0
+newslab_exporter_query_success{query="pipeline_topics"} 0
+newslab_exporter_query_success{query="stored_counts"} 0
+```
+
+Status: failed
+
+Notes:
+
+- 순차 실행에서는 7개 모두 성공했으나 동시 실행으로 바꾸자 5~6개가 실패했다.
+- **매 scrape마다 성공하는 쿼리가 달랐다.** 특정 쿼리의 문제가 아니라 공유 자원 경쟁임을 시사했다.
+- **실패한 쿼리의 업무 지표는 하나도 노출되지 않았고, 성공한 쿼리의 지표만 노출됐다.**
+  "하나가 실패해도 나머지는 내보낸다"는 설계가 실제 장애에서 의도대로 동작했다.
+  `errgroup.WithContext`를 쓰지 않은 판단이 여기서 검증됐다.
+
+### 원인 진단 — 로그 추가 후 확정
+
+당시 코드는 `err`를 받아 버리고 `query_success=0`만 내보냈다.
+**실패 사실은 알 수 있으나 원인을 알 수 없어 진단이 불가능했다.**
+
+조치: `reportQueryFailure` 헬퍼를 추가해 실패를 로그에 남기도록 수정했다.
+
+Result:
+
+```text
+collector query failed: query=crawl_runs err=ERROR: prepared statement
+"stmtcache_19b81018f4887842a4b5693cc475cae7f1a238e22b7384f7" does not exist (SQLSTATE 26000)
+```
+
+원인: Supabase transaction pooler(port 6543)는 트랜잭션마다 backend connection을 재배정한다.
+pgx 기본값인 extended protocol은 PREPARE한 backend와 EXECUTE하는 backend가 달라지면 실패한다.
+순차 실행에서는 커넥션 하나를 재사용해 드러나지 않았고, 동시 실행이 방아쇠가 됐다.
+
+### 조치
+
+```go
+connCfg.DefaultQueryExecMode = pgx.QueryExecModeSimpleProtocol
+db.SetMaxOpenConns(maxConns)
+db.SetMaxIdleConns(maxConns)
+```
+
+- simple protocol은 prepared statement를 만들지 않으므로 backend가 바뀌어도 무관하다
+- `DB_MAX_CONNS`(기본 4) 설정을 추가했다. 감시자가 감시 대상의 커넥션을 무제한 점유하면 안 된다.
+  Task 문서 "설정" 절에 있었으나 구현이 누락됐던 항목이다
+
+Result (조치 후):
+
+```text
+newslab_exporter_query_success{query="crawl_runs"} 1
+newslab_exporter_query_success{query="extraction_items"} 1
+newslab_exporter_query_success{query="last_success"} 1
+newslab_exporter_query_success{query="pipeline_embeddings"} 1
+newslab_exporter_query_success{query="pipeline_runs"} 1
+newslab_exporter_query_success{query="pipeline_topics"} 1
+newslab_exporter_query_success{query="stored_counts"} 1
+```
+
+Status: passed
+
+지표 35줄이 순차 실행 시점과 동일함을 확인했다.
+
+---
+
+## UNIT-04. 테스트
+
+### 구현 범위
+
+- `internal/config/config_test.go` — 순수 로직 테스트 (mock 불필요)
+- `internal/collector/collector_test.go` — `go-sqlmock`으로 DB를 대체
+
+Command:
+
+```bash
+go test ./... -v
+```
+
+Result:
+
+```text
+=== RUN   TestCollectCrawlRuns_정상이면_지표를_내보낸다
+--- PASS
+=== RUN   TestCollectCrawlRuns_쿼리가_실패하면_업무지표를_내보내지_않는다
+2026/08/11 23:25:42 collector query failed: query=crawl_runs err=연결 끊김
+--- PASS
+=== RUN   TestCollectPipelineLastSuccess_성공이력이_없으면_지표를_생략한다
+--- PASS
+ok      github.com/seochanjin/news-lab-exporter/internal/collector    0.557s
+
+=== RUN   TestGetEnvInt
+    --- PASS: 값이_없으면_기본값을_쓴다
+    --- PASS: 정수_문자열을_파싱한다
+    --- PASS: 정수가_아니면_오류
+    --- PASS: 0이면_오류
+    --- PASS: 음수면_오류
+=== RUN   TestLoad_DATABASE_URL이_없으면_실패한다
+--- PASS
+ok      github.com/seochanjin/news-lab-exporter/internal/config
+```
+
+Status: passed (9 케이스)
+
+Notes:
+
+- 실패 테스트 실행 중 `collector query failed: ... err=연결 끊김` 로그가 출력됐다.
+  실패 경로가 실제로 실행됐다는 증거다.
+- 테스트는 실제 DB와 네트워크에 접속하지 않는다. `sqlmock`이 `*sql.DB`를 대체한다.
+- 실제 DB로는 "연결이 끊긴 상황"을 만들 수 없으므로 mock이 필요했다.
+
+### 고정한 동작
+
+| 테스트 | 고정한 원칙 |
+| --- | --- |
+| `쿼리가_실패하면_업무지표를_내보내지_않는다` | 실패를 `0`으로 덮지 않는다. 2026-08-10 트랜잭션 풀러 장애에서 실제 확인한 동작을 회귀 방지로 고정 |
+| `성공이력이_없으면_지표를_생략한다` | `NULL`과 `0`을 구분한다. `0`은 1970-01-01로 표시되어 "한 번도 성공 안 함"과 "오래됨"을 구분할 수 없다 |
+| `getEnvInt` 5케이스 | 잘못된 설정으로 반쯤 동작하는 상태를 만들지 않는다 |
+
+### 미수행
+
+- `Collect()` 전체를 대상으로 한 통합 테스트 (쿼리 7개 전부 mock 필요)
+- 나머지 5개 collect 함수의 개별 테스트 — `collectCrawlRuns`와 구조가 동일하므로
+  대표 케이스만 검증했다. 커버리지를 늘리려면 추가 필요
 
 ---
 
 ## 미수행
 
-- UNIT-03c `errgroup` 동시 실행
-- UNIT-04 테스트
 - UNIT-05 컨테이너화, 이미지 크기 측정
 - UNIT-06 Kubernetes manifest
 - UNIT-07 운영 반영 (사람 수행)
 - read-only 권한 계정 발급 (사람 수행)
-- read-only 동작의 실제 거부 확인 (UNIT-03에서 수행)
-- `gofmt` / `go vet` / `go test` 미실행
+- **read-only 동작의 실제 거부 확인** — 모든 쿼리가 `select`라 UNIT-03·04에서도
+  확인 기회가 없었다. UNIT-07 운영 반영 시 사람이 확인한다
+- `Collect()` 통합 테스트와 나머지 collect 함수 테스트
 
 ## 사람이 수행할 항목
 

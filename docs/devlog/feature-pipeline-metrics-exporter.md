@@ -113,13 +113,67 @@ pgx는 이를 해석하지 못한다. exporter 저장소의 `.env`에는 표준 
 time() - newslab_pipeline_last_success_timestamp_seconds{pipeline="three_day"} > 26*3600
 ```
 
+## 동시 실행 — `errgroup`이 아니라 `WaitGroup`
+
+Task 문서에는 `errgroup`이라고 적어뒀지만 구현하면서 바꿨다.
+
+`errgroup`이 주는 건 에러 전파, `WithContext` 취소 전파, 동시성 상한 셋이다.
+우리는 각 함수가 `query_success=0`으로 실패를 자체 처리하므로 에러 전파가 필요 없고,
+**`WithContext`의 취소 전파는 오히려 요구와 반대다.** 쿼리 하나가 실패해도
+나머지 지표는 나와야 하기 때문이다.
+
+에러를 전파하지 않는데 `errgroup`을 쓰면 전 함수가 `return nil`만 하게 된다.
+필요해서가 아니라 관례로 쓰는 것이 되므로 `sync.WaitGroup`을 택했다.
+
+## 동시 실행이 드러낸 장애
+
+순차 실행에서 7개 모두 성공하던 쿼리가, 동시 실행으로 바꾸자 매 scrape마다
+**무작위로 5~6개가 실패**했다. 성공하는 쿼리가 매번 달랐다는 점에서
+특정 쿼리의 문제가 아니라 공유 자원 경쟁임을 알 수 있었다.
+
+그런데 당시 코드로는 **원인을 알 수 없었다.** `err`를 받아 버리고
+`query_success=0`만 내보내고 있었기 때문이다. 실패 사실은 알지만 이유는 몰랐다.
+
+`reportQueryFailure` 헬퍼로 로그를 남기도록 고치자 한 줄로 확정됐다.
+
+```
+prepared statement "stmtcache_19b8..." does not exist (SQLSTATE 26000)
+```
+
+Supabase transaction pooler는 트랜잭션마다 backend connection을 재배정한다.
+pgx 기본값인 extended protocol은 PREPARE한 backend와 EXECUTE하는 backend가
+달라지면 실패한다. 순차 실행에서는 커넥션 하나를 재사용해 드러나지 않았고
+동시 실행이 방아쇠가 됐다.
+
+`DefaultQueryExecMode`를 simple protocol로 바꾸고 `DB_MAX_CONNS`(기본 4) 상한을
+추가해 해결했다. **환경 제약에 맞춰 클라이언트 동작을 조정한 것이지 성능 최적화가 아니다.**
+
+한 가지 부수 효과가 있었다. 장애 중에 **실패한 쿼리의 업무 지표는 하나도 노출되지 않고
+성공한 쿼리의 지표만 노출됐다.** "하나가 실패해도 나머지는 내보낸다"는 설계가
+실제 장애에서 의도대로 동작함이 우연히 검증됐다.
+
+## 테스트 — 무엇을 고정했는가
+
+`go-sqlmock`으로 `*sql.DB`를 대체했다. **실제 DB로는 "연결이 끊긴 상황"을 만들 수 없기 때문이다.**
+
+| 테스트 | 고정한 원칙 |
+| --- | --- |
+| `쿼리가_실패하면_업무지표를_내보내지_않는다` | 실패를 `0`으로 덮지 않는다. 위 장애에서 확인한 동작을 회귀 방지로 고정 |
+| `성공이력이_없으면_지표를_생략한다` | `NULL`과 `0`을 구분한다 |
+| `getEnvInt` 5케이스 | 잘못된 설정으로 반쯤 동작하는 상태를 만들지 않는다 |
+
+실패 테스트를 돌리면 `collector query failed: ... err=연결 끊김` 로그가 출력된다.
+실패 경로가 실제로 실행됐다는 증거다.
+
+커버리지를 넓히기보다 **판단이 담긴 지점을 고정하는 데 집중했다.**
+나머지 5개 collect 함수는 `collectCrawlRuns`와 구조가 같아 대표 케이스만 검증했다.
+
 ## 남은 작업
 
-- `errgroup`으로 쿼리 7개 동시 실행 (UNIT-03c)
-- 테스트 — 특히 **쿼리 하나가 실패했을 때 나머지 지표가 정상 노출되는지**,
-  실패한 쿼리의 지표가 `0`으로 노출되지 **않는지**
-- read-only 동작의 실제 거부 확인 (이번 UNIT은 전부 `select`라 확인 기회가 없었다)
+- read-only 동작의 실제 거부 확인 — 모든 쿼리가 `select`라 아직 확인 기회가 없었다.
+  UNIT-07 운영 반영 시 사람이 확인한다
 - 컨테이너화와 이미지 크기 측정, Kubernetes manifest
+- `Collect()` 통합 테스트
 - Grafana 패널 추가는 `news-lab` 저장소의 별도 Task
 
 ## 후속 조사 대상 (exporter 범위 아님)
