@@ -1,0 +1,76 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: news-lab-exporter
+  labels:
+    app: news-lab-exporter
+spec:
+  # replica는 1로 고정한다.
+  # 지표 값이 DB에서 오므로 replica를 늘려도 값이 같고, Prometheus가 instance별로
+  # 중복 수집해 DB 부하만 두 배가 된다.
+  replicas: 1
+  selector:
+    matchLabels:
+      app: news-lab-exporter
+  template:
+    metadata:
+      labels:
+        app: news-lab-exporter
+    spec:
+      nodeSelector:
+        workload: app
+      containers:
+        - name: news-lab-exporter
+          # 태그는 40자 git SHA로 고정한다. news-lab 저장소가 쓰는 규약과 같다.
+          # latest를 쓰면 지금 돌고 있는 것이 어느 커밋인지 클러스터에서 확인할 수 없고,
+          # 되돌릴 대상도 없어진다. Argo CD는 manifest가 그대로면 Synced로 표시하는데
+          # 그 사이 컨테이너 내용만 바뀌는 상황도 생긴다.
+          image: seocj/news-lab-exporter:REPLACE_WITH_GIT_SHA
+          # 태그가 불변이므로 이미 받아둔 이미지를 다시 받을 이유가 없다.
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: metrics
+              containerPort: 9310
+          env:
+            # news-api-secret은 SQLAlchemy 형식(postgresql+psycopg://)이라 pgx가 파싱하지 못한다.
+            # exporter 전용 Secret을 별도로 만들어 표준 형식과 read-only 계정을 넣는다.
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: news-lab-exporter-secret
+                  key: DATABASE_URL
+            - name: LISTEN_ADDR
+              value: ":9310"
+            - name: DB_MAX_CONNS
+              value: "4"
+          # probe는 /metrics를 때리지 않는다. /metrics 한 번이 DB 조회 7개를 유발하므로
+          # probe가 감시 대상 DB에 부하를 주게 된다.
+          # 또한 probe를 DB 상태에 연동하지 않는다. DB가 죽었을 때 Pod가 NotReady가 되면
+          # Prometheus가 scrape를 멈추는데, 그 순간이 바로 query_success=0이 필요한 때다.
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: metrics
+            initialDelaySeconds: 5
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: metrics
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: "10m"
+              memory: "32Mi"
+            limits:
+              cpu: "100m"
+              memory: "128Mi"
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault

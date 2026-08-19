@@ -4,7 +4,7 @@
 
 pending
 
-UNIT-01 ~ UNIT-04 완료. UNIT-05~07 미수행.
+UNIT-01 ~ UNIT-06 완료(manifest dry-run 재검증 대기). UNIT-07 미수행.
 
 ## 환경
 
@@ -415,11 +415,181 @@ Notes:
 
 ---
 
+## UNIT-05. 컨테이너화
+
+### 구현 범위
+
+- multi-stage `Dockerfile` (`golang:1.26-alpine` build → `distroless/static-debian12:nonroot` runtime)
+- `.dockerignore`
+- `main.go`에 `/healthz` 추가 (probe 용도)
+
+### 빌드
+
+Command:
+
+```bash
+docker build -t news-lab-exporter:local .
+```
+
+Status: passed
+
+### 이미지 크기 측정
+
+Command:
+
+```bash
+docker images news-lab-exporter:local --format '{{.Size}}'
+docker images seocj/news-api --format '{{.Repository}} {{.Size}}'
+```
+
+Result:
+
+```text
+25MB
+seocj/news-api 58.5MB
+```
+
+| 이미지 | 기반 | 크기 |
+| --- | --- | --- |
+| `news-lab-exporter` | Go + distroless/static | **25 MB** |
+| `seocj/news-api` | Python 3.12-slim | **58.5 MB** |
+
+**감소율 57%** (58.5 → 25 MB).
+
+Notes:
+
+- **사전 추정과 실측이 달랐다.** `학습_Go-왜-쓰는가.md`에는 Python 150~400MB,
+  Go distroless 10~20MB로 적어뒀으나 실측은 각각 58.5MB, 25MB였다.
+  - 기존 이미지가 `python:3.12-slim` 기반이라 이미 가볍다
+  - Go 바이너리에 pgx와 prometheus 클라이언트가 포함되어 20MB를 넘었다
+- 일반적으로 인용되는 "10배 차이"는 이 프로젝트에 해당하지 않는다.
+  **추정치가 아니라 실측치를 근거로 쓴다.**
+- 이 규모에서는 이미지 크기보다 **런타임 설치가 필요 없다는 점**이 실질적 이점이다.
+
+### 컨테이너 동작 확인
+
+Command:
+
+```bash
+set -a; source .env; set +a
+docker run --rm -p 9310:9310 -e DATABASE_URL="$DATABASE_URL" news-lab-exporter:local
+
+curl -s localhost:9310/healthz
+curl -s localhost:9310/metrics | grep query_success
+```
+
+Result:
+
+```text
+2026/08/19 13:42:21 db connected (read only)
+2026/08/19 13:42:21 listening on :9310
+
+ok
+
+newslab_exporter_query_success{query="crawl_runs"} 1
+newslab_exporter_query_success{query="extraction_items"} 1
+newslab_exporter_query_success{query="last_success"} 1
+newslab_exporter_query_success{query="pipeline_embeddings"} 1
+newslab_exporter_query_success{query="pipeline_runs"} 1
+newslab_exporter_query_success{query="pipeline_topics"} 1
+newslab_exporter_query_success{query="stored_counts"} 1
+```
+
+Status: passed
+
+Notes:
+
+- distroless 이미지에는 셸이 없으므로 exec probe를 쓸 수 없다. httpGet probe만 가능하다.
+- `/healthz`는 DB를 조회하지 않는다. 아래 UNIT-06 참조.
+
+---
+
+## UNIT-06. Kubernetes manifest
+
+### 구현 범위
+
+- `k8s/deployment.yaml` — replica 1, `nodeSelector: workload=app`, securityContext, probe
+- `k8s/service.yaml` — ClusterIP, named port `metrics`
+- `k8s/servicemonitor.yaml` — `release: monitoring` label
+
+### 설계 판단
+
+**replica는 1로 고정한다.**
+지표 값이 DB에서 오므로 replica를 늘려도 값이 같다. Prometheus가 instance별로 중복
+수집해 운영 DB 조회만 두 배가 된다.
+
+**probe는 `/metrics`를 때리지 않는다.**
+`/metrics` 한 번이 DB 조회 7개를 유발한다. probe를 거기 걸면 감시자가 감시 대상에
+주기적으로 부하를 준다.
+
+**probe를 DB 상태에 연동하지 않는다.**
+DB 장애 시 Pod가 `NotReady`가 되면 Prometheus가 scrape를 멈춘다.
+그 순간이 바로 `query_success=0`을 확인해야 할 때다.
+**감시자가 감시 대상과 함께 죽으면 안 된다.**
+
+**타임아웃 순서**: exporter 내부 `context` 10s < `scrapeTimeout` 30s < `interval` 60s.
+안쪽이 먼저 끊겨야 어느 쿼리가 느린지 `query_success`로 드러난다.
+
+`interval`이 60s인 이유는 이 지표들이 하루 단위 CronJob 결과이기 때문이다.
+더 자주 긁어도 값이 바뀌지 않고 운영 DB 조회만 늘어난다.
+
+### ServiceMonitor label
+
+`news-lab/k8s/monitoring/kube-prometheus-stack-values.yaml`에
+`serviceMonitorSelectorNilUsesHelmValues` 설정이 없어 chart 기본값 `true`가 적용된다.
+이 경우 Prometheus는 **Helm release 이름 label이 붙은 ServiceMonitor만 수집**한다.
+
+```yaml
+metadata:
+  labels:
+    release: monitoring
+```
+
+이 label이 없으면 `apply`가 성공해도 Prometheus가 조용히 무시한다. 오류가 나지 않는다.
+
+### Secret
+
+기존 `news-api-secret`의 `DATABASE_URL`은 SQLAlchemy 형식(`postgresql+psycopg://`)이라
+pgx가 파싱하지 못한다. **exporter 전용 Secret이 필요하다.**
+
+```bash
+kubectl create secret generic news-lab-exporter-secret \
+  --from-literal=DATABASE_URL='postgresql://<read-only 계정>:<비밀번호>@<host>:6543/postgres'
+```
+
+read-only 계정 발급과 Secret 생성은 UNIT-07의 사람 수행 항목이다.
+
+### manifest 검증
+
+Command:
+
+```bash
+kubectl apply --dry-run=client -f k8s/
+```
+
+Result:
+
+```text
+error validating "k8s/deployment.yaml": failed to download openapi:
+Get "http://localhost:8080/openapi/v2?timeout=32s": dial tcp [::1]:8080: connect: connection refused
+```
+
+Status: **미수행**
+
+kubectl이 클러스터에 연결되지 않아 openapi 스키마를 받지 못했다. manifest 자체의 문제가
+아니라 `KUBECONFIG` 미설정이다. `ServiceMonitor`는 CRD이므로 클러스터 연결 상태에서
+재검증해야 한다.
+
+### 미수행
+
+- `KUBECONFIG` 지정 후 `kubectl apply --dry-run=client` 재실행
+- `.github/workflows/docker-build.yml` 작성 — 원격 도구로 쓸 수 없는 보호 경로라 수동 생성 필요
+
 ## 미수행
 
-- UNIT-05 컨테이너화, 이미지 크기 측정
-- UNIT-06 Kubernetes manifest
 - UNIT-07 운영 반영 (사람 수행)
+- `.github/workflows/docker-build.yml` 작성
+- `KUBECONFIG` 지정 후 manifest dry-run 재검증
 - read-only 권한 계정 발급 (사람 수행)
 - **read-only 동작의 실제 거부 확인** — 모든 쿼리가 `select`라 UNIT-03·04에서도
   확인 기회가 없었다. UNIT-07 운영 반영 시 사람이 확인한다

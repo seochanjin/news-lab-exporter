@@ -168,11 +168,64 @@ pgx 기본값인 extended protocol은 PREPARE한 backend와 EXECUTE하는 backen
 커버리지를 넓히기보다 **판단이 담긴 지점을 고정하는 데 집중했다.**
 나머지 5개 collect 함수는 `collectCrawlRuns`와 구조가 같아 대표 케이스만 검증했다.
 
+## 이미지 크기 — 추정과 실측이 달랐다
+
+`학습_Go-왜-쓰는가.md`에 Python 150~400MB, Go distroless 10~20MB로 적어뒀었다.
+직접 재보니 둘 다 틀렸다.
+
+| 이미지 | 기반 | 실측 |
+| --- | --- | --- |
+| `news-lab-exporter` | Go + distroless/static | **25 MB** |
+| `seocj/news-api` | Python 3.12-slim | **58.5 MB** |
+
+**감소율 57%.** 흔히 인용되는 "10배 차이"는 이 프로젝트에 해당하지 않았다.
+기존 이미지가 이미 slim 기반이고, Go 바이너리에 pgx와 prometheus 클라이언트가
+포함되어 20MB를 넘었기 때문이다.
+
+**추정치가 아니라 실측치를 쓴다.** 그리고 이 규모에서는 이미지 크기보다
+**런타임 설치가 필요 없다는 점**이 실질적 이점이다. 감시 대상 서버에
+파이썬 런타임을 요구하지 않아도 된다는 것.
+
+## 배포 설계 — 감시자가 감시 대상과 함께 죽으면 안 된다
+
+`/healthz`를 따로 만들고 probe를 거기 걸었다. 이유가 둘이다.
+
+**첫째, `/metrics` 한 번이 DB 조회 7개를 유발한다.** probe를 `/metrics`에 걸면
+감시자가 감시 대상에 주기적으로 부하를 준다.
+
+**둘째, probe를 DB 상태에 연동하면 안 된다.** DB 장애 때 Pod가 `NotReady`가 되면
+Prometheus가 scrape를 멈춘다. **그 순간이 바로 `query_success=0`을 봐야 할 때다.**
+`/healthz`는 프로세스가 살아 있는지만 답한다.
+
+replica는 1로 고정했다. 지표 값이 DB에서 오므로 replica를 늘려도 값이 같고,
+Prometheus가 instance별로 중복 수집해 운영 DB 조회만 두 배가 된다.
+
+타임아웃은 안쪽부터 짧게 뒀다 — `context` 10s < `scrapeTimeout` 30s < `interval` 60s.
+안쪽이 먼저 끊겨야 어느 쿼리가 느린지 `query_success`로 드러난다.
+
+## 조용히 실패하는 설정 — ServiceMonitor label
+
+`kube-prometheus-stack` values에 `serviceMonitorSelectorNilUsesHelmValues` 설정이 없어
+chart 기본값 `true`가 적용된다. 이 경우 Prometheus는 **Helm release 이름 label이 붙은
+ServiceMonitor만 수집한다.**
+
+```yaml
+metadata:
+  labels:
+    release: monitoring
+```
+
+이 label이 없으면 `kubectl apply`가 성공해도 **Prometheus가 조용히 무시한다.**
+오류가 나지 않으므로 Targets 화면을 보기 전까지는 알 수 없다.
+manifest를 쓰기 전에 기존 values를 확인해 미리 넣었다.
+
 ## 남은 작업
 
+- 운영 반영 (UNIT-07) — read-only 계정 발급, Secret 생성, `kubectl apply`,
+  Prometheus Targets에서 `UP` 확인
+- `.github/workflows/docker-build.yml` 작성 (보호 경로라 수동 생성 필요)
 - read-only 동작의 실제 거부 확인 — 모든 쿼리가 `select`라 아직 확인 기회가 없었다.
   UNIT-07 운영 반영 시 사람이 확인한다
-- 컨테이너화와 이미지 크기 측정, Kubernetes manifest
 - `Collect()` 통합 테스트
 - Grafana 패널 추가는 `news-lab` 저장소의 별도 Task
 

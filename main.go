@@ -45,6 +45,17 @@ func main() {
 
 	http.Handle(cfg.MetricsPath, promhttp.Handler())
 
+	// /healthz는 프로세스가 살아 있는지만 답한다. DB를 조회하지 않는다.
+	//
+	// 이유가 둘이다.
+	// 1. /metrics 한 번이 DB 조회 7개를 유발하므로 probe가 감시 대상에 부하를 준다.
+	// 2. DB 상태를 probe에 연동하면 DB 장애 때 Pod가 NotReady가 되어 Prometheus가
+	//    scrape를 멈춘다. 그 순간이 바로 query_success=0이 필요한 때다.
+	http.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok\n"))
+	})
+
 	log.Printf("listening on %s", cfg.ListenAddr)
 
 	err = http.ListenAndServe(cfg.ListenAddr, nil)
