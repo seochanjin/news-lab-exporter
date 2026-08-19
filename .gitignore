@@ -1,0 +1,4 @@
+.DS_Store
+/news-lab-exporter
+*.exe
+.env
