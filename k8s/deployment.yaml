@@ -67,7 +67,12 @@ spec:
               cpu: "100m"
               memory: "128Mi"
           securityContext:
+            # distroless :nonroot 이미지는 USER를 이름(nonroot)으로 지정한다.
+            # runAsNonRoot는 숫자 UID여야 root가 아님을 검증할 수 있으므로
+            # UID/GID를 명시한다. distroless nonroot는 65532다.
             runAsNonRoot: true
+            runAsUser: 65532
+            runAsGroup: 65532
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
             capabilities:

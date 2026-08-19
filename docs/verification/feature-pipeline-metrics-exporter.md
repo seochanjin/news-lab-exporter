@@ -2,9 +2,9 @@
 
 ## Verification Status
 
-pending
+passed
 
-UNIT-01 ~ UNIT-06 완료. UNIT-07(운영 반영) 미수행.
+UNIT-01 ~ UNIT-07 완료. 운영 클러스터에서 Prometheus 수집을 확인했다.
 
 ## 환경
 
@@ -601,16 +601,227 @@ Notes:
 
 - `.github/workflows/docker-build.yml` 작성 — 원격 도구로 쓸 수 없는 보호 경로라 수동 생성 필요
 
-## 미수행
+---
 
-- UNIT-07 운영 반영 (사람 수행)
-- `.github/workflows/docker-build.yml` 작성
-- read-only 권한 계정 발급 (사람 수행)
-- **read-only 동작의 실제 거부 확인** — 모든 쿼리가 `select`라 UNIT-03·04에서도
-  확인 기회가 없었다. UNIT-07 운영 반영 시 사람이 확인한다
+## UNIT-07. 운영 반영 (사람 수행)
+
+수행일: 2026-08-19 ~ 08-20
+
+### ① read-only 역할 발급
+
+Command (Supabase SQL Editor):
+
+```sql
+create role newslab_exporter with login password '<생성한 32자 영숫자>';
+grant connect on database postgres to newslab_exporter;
+grant usage on schema public to newslab_exporter;
+grant select on
+  crawl_runs, extraction_runs, three_day_topic_runs,
+  weekly_topic_runs, articles, article_embeddings
+to newslab_exporter;
+```
+
+Status: passed
+
+Notes:
+
+- exporter가 읽는 6개 table에만 `select`를 부여했다. `all tables`가 편하지만
+  지표를 추가할 때 권한을 다시 주게 하는 편이 "이 계정이 무엇을 읽는지"를 명시적으로 유지한다.
+- **Supavisor pooler(6543)는 사용자명이 `<역할명>.<프로젝트ref>` 형식이어야 한다.**
+  어느 프로젝트로 라우팅할지 판단하는 데 쓰이며, 이를 빠뜨리면 인증에 실패한다.
+- 비밀번호는 영숫자만으로 생성했다. `base64`가 만드는 `+`, `/`는 접속 문자열에서
+  URL 인코딩이 필요해 파싱 문제를 일으킨다.
+
+### ② read-only 동작 검증 ★ UNIT-02부터 미검증이던 항목
+
+`db.Ping()` 직후에 임시 코드를 넣어 쓰기를 시도했다.
+
+```go
+_, writeErr := db.Exec("create table zzz_readonly_check(i int)")
+log.Printf(">>> write attempt: %v", writeErr)
+```
+
+Result:
+
+```text
+>>> write attempt: ERROR: permission denied for schema public (SQLSTATE 42501)
+```
+
+Status: passed
+
+Notes:
+
+- **권한 레벨이 먼저 막았다.** 계정에 `create` 권한이 없어 트랜잭션 모드 검사까지 가지 않았다.
+- 따라서 **코드 레벨(`default_transaction_read_only`)은 여전히 단독으로 검증되지 않았다.**
+  분리 검증하려면 기존 계정으로 같은 코드를 실행해
+  `cannot execute CREATE TABLE in a read-only transaction (SQLSTATE 25006)`을 확인해야 한다.
+- 검증 후 임시 코드는 삭제했다.
+
+### ③ Secret 생성
+
+Command:
+
+```bash
+set -a; source .env; set +a
+echo "${#DATABASE_URL}"        # 117
+
+kubectl create secret generic news-lab-exporter-secret \
+  --from-literal=DATABASE_URL="$DATABASE_URL"
+
+kubectl describe secret news-lab-exporter-secret
+```
+
+Result:
+
+```text
+DATABASE_URL:  117 bytes
+```
+
+Status: passed
+
+Notes:
+
+- 첫 시도에서 `DATABASE_URL: 0 bytes`로 생성됐다. `source .env`를 실행한 셸과
+  `kubectl create secret`을 실행한 셸이 달라 변수가 비어 있었다.
+  **`echo "${#DATABASE_URL}"`로 길이를 먼저 확인하는 절차를 넣었다.**
+- Secret 값은 git에 없다. 클러스터를 재구축하면 이 절차를 사람이 다시 수행해야 한다.
+
+### ④ 배포 중 만난 문제 두 가지
+
+**1. 자리표시자 태그로 image pull 실패**
+
+```text
+Failed to pull image "seocj/news-lab-exporter:REPLACE_WITH_GIT_SHA": not found
+```
+
+원인: `feature` 브랜치에서 `kubectl apply`를 실행했다. 이미지 태그를 실제 SHA로 바꾼
+`update-manifest` PR은 `main`에 머지됐으므로 feature 브랜치에는 반영되지 않았다.
+
+**배포한 것과 커밋된 것이 달랐다.** GitOps가 방지하려는 상황이며, 자리표시자였기에
+즉시 실패해 드러났다. `latest` 같은 값이었다면 조용히 다른 이미지가 떴을 것이다.
+
+조치: `main`으로 전환·pull 후 재적용. **이후 apply는 항상 `main`에서 수행한다.**
+
+**2. distroless + `runAsNonRoot` 충돌**
+
+```text
+container has runAsNonRoot and image has non-numeric user (nonroot),
+cannot verify user is non-root
+```
+
+원인: distroless `:nonroot` 이미지는 `USER`를 이름으로 지정한다.
+`runAsNonRoot: true`는 숫자 UID여야 root 여부를 검증할 수 있다.
+
+조치: `runAsUser: 65532`, `runAsGroup: 65532`를 명시했다.
+
+### ⑤ 배포 확인
+
+Command:
+
+```bash
+kubectl rollout status deployment/news-lab-exporter
+kubectl get pods -l app=news-lab-exporter
+kubectl logs -l app=news-lab-exporter --tail=20
+```
+
+Result:
+
+```text
+deployment "news-lab-exporter" successfully rolled out
+
+NAME                                 READY   STATUS    RESTARTS   AGE
+news-lab-exporter-7c96f495f7-5wrsz   1/1     Running   0          2m17s
+
+2026/08/19 15:36:16 db connected (read only)
+2026/08/19 15:36:16 listening on :9310
+```
+
+이미지 pull 크기: **5,598,979 bytes** (kubelet 보고값). Docker Hub 레지스트리 값과 일치한다.
+
+Status: passed
+
+### ⑥ 클러스터 내 지표 확인
+
+Command:
+
+```bash
+kubectl port-forward deploy/news-lab-exporter 9310:9310
+curl -s localhost:9310/metrics | grep query_success
+```
+
+Result:
+
+```text
+newslab_exporter_query_success{query="crawl_runs"} 1
+newslab_exporter_query_success{query="extraction_items"} 1
+newslab_exporter_query_success{query="last_success"} 1
+newslab_exporter_query_success{query="pipeline_embeddings"} 1
+newslab_exporter_query_success{query="pipeline_runs"} 1
+newslab_exporter_query_success{query="pipeline_topics"} 1
+newslab_exporter_query_success{query="stored_counts"} 1
+```
+
+Status: passed — read-only 계정으로 6개 table 모두 조회 가능함을 확인했다.
+
+### ⑦ Prometheus 수집 확인 ★ 최종 검증
+
+Command:
+
+```bash
+kubectl get servicemonitor -n default -o custom-columns=NAME:.metadata.name,RELEASE:.metadata.labels.release
+kubectl port-forward -n monitoring svc/monitoring-kube-prometheus-prometheus 9090:9090
+curl -s 'localhost:9090/api/v1/query?query=newslab_pipeline_runs_total'
+```
+
+Result:
+
+```text
+NAME                RELEASE
+news-lab-exporter   monitoring
+
+{"status":"success","data":{"resultType":"vector","result":[
+  {"metric":{"__name__":"newslab_pipeline_runs_total",
+             "container":"news-lab-exporter","endpoint":"metrics",
+             "instance":"10.42.1.71:9310","job":"news-lab-exporter",
+             "namespace":"default","pipeline":"extraction",
+             "pod":"news-lab-exporter-7c96f495f7-5wrsz",
+             "service":"news-lab-exporter","status":"success"},
+   "value":[1787154122.807,"295"]}, ...
+```
+
+Status: passed
+
+Notes:
+
+- **Prometheus가 exporter를 발견하고 60초 간격으로 수집하고 있다.**
+- 우리가 정의한 label은 `pipeline`, `status` 둘뿐이다.
+  `job`, `instance`, `namespace`, `pod`, `service`, `container`, `endpoint`는
+  ServiceMonitor 기반 서비스 디스커버리가 자동으로 부여한 것이다.
+  **manifest 어디에도 IP나 주소를 기록하지 않았다.**
+- 기존 ServiceMonitor 13개가 모두 `release: monitoring`을 사용하며 우리 것과 일치한다.
+
+### 미수행
+
+- Grafana 패널 추가 (`news-lab` 저장소의 별도 Task)
+- 신선도·부분 실패 알림 규칙 (`news-lab` 저장소)
+- 코드 레벨 read-only 단독 검증 (②번 Notes 참조)
+
+## 남은 작업
+
+이 Task 범위 밖이거나 다른 저장소의 작업이다.
+
+- Grafana 패널 추가 (`news-lab` 저장소)
+- 신선도·부분 실패 알림 규칙 (`news-lab` 저장소)
+- 코드 레벨 read-only 단독 검증 — 권한 레벨이 먼저 막아 분리 검증되지 않았다
 - `Collect()` 통합 테스트와 나머지 collect 함수 테스트
 
-## 사람이 수행할 항목
+## 수행한 사람 작업 (재구축 시 반복 필요)
+
+- Supabase read-only 역할 발급, `grant select` 6개 table
+- `news-lab-exporter-secret` 생성 (값은 git에 없다)
+- `kubectl apply -f k8s/` — 반드시 `main` 브랜치에서
+- Prometheus Targets `UP` 확인
+
 
 - Supabase에서 read-only 역할 발급 및 Secret 생성
 - 운영 K3s 적용, 이미지 push
