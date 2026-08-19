@@ -267,7 +267,7 @@ git grep -n -i -E "DATABASE_URL=|password|api[_-]?key|token" -- ':!docs/**'
 - [x] UNIT-03 Collector 구현과 쿼리 7개 (03c 동시 실행 포함)
 - [x] UNIT-04 테스트 (9 케이스)
 - [x] UNIT-05 컨테이너화와 이미지 크기 측정 (25MB / Python 58.5MB 대비 57% 감소)
-- [x] UNIT-06 Kubernetes manifest (KUBECONFIG 지정 후 dry-run 재검증 대기)
+- [x] UNIT-06 Kubernetes manifest (dry-run 검증 통과)
 - [ ] UNIT-07 운영 반영과 검증 (사람 수행)
 
 ---

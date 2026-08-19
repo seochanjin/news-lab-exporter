@@ -4,7 +4,7 @@
 
 pending
 
-UNIT-01 ~ UNIT-06 완료(manifest dry-run 재검증 대기). UNIT-07 미수행.
+UNIT-01 ~ UNIT-06 완료. UNIT-07(운영 반영) 미수행.
 
 ## 환경
 
@@ -561,35 +561,50 @@ read-only 계정 발급과 Secret 생성은 UNIT-07의 사람 수행 항목이�
 
 ### manifest 검증
 
-Command:
-
-```bash
-kubectl apply --dry-run=client -f k8s/
-```
-
-Result:
+1차 시도는 `KUBECONFIG` 미설정으로 실패했다.
 
 ```text
 error validating "k8s/deployment.yaml": failed to download openapi:
 Get "http://localhost:8080/openapi/v2?timeout=32s": dial tcp [::1]:8080: connect: connection refused
 ```
 
-Status: **미수행**
+manifest 문제가 아니라 kubectl이 클러스터를 찾지 못한 것이었다.
 
-kubectl이 클러스터에 연결되지 않아 openapi 스키마를 받지 못했다. manifest 자체의 문제가
-아니라 `KUBECONFIG` 미설정이다. `ServiceMonitor`는 CRD이므로 클러스터 연결 상태에서
-재검증해야 한다.
+Command:
+
+```bash
+KUBECONFIG=~/.kube/oci-k3s.yaml kubectl apply --dry-run=client -f k8s/
+```
+
+Result:
+
+```text
+deployment.apps/news-lab-exporter created (dry run)
+service/news-lab-exporter created (dry run)
+servicemonitor.monitoring.coreos.com/news-lab-exporter created (dry run)
+```
+
+Status: passed
+
+Notes:
+
+- `ServiceMonitor`가 인식됐다는 것은 클러스터에 Prometheus Operator CRD가 존재하고
+  manifest가 해당 스키마에 유효하다는 뜻이다. 실제 적용(`--dry-run` 없이)은 사람이 수행한다.
+- **DB나 Prometheus에 주소를 적은 곳이 없다.** Deployment가 Pod에 `app=news-lab-exporter`
+  label을 붙이고, Service가 그 label로 Pod를 찾고, ServiceMonitor가 그 label로 Service를
+  찾는다. Prometheus Operator가 이를 읽어 scrape 설정을 자동 생성한다.
+  Pod IP가 바뀌어도 설정을 고칠 필요가 없다.
+- Prometheus는 Service를 경유하지 않고 Pod IP로 직접 scrape한다.
+  Service는 대상 발견(Endpoints) 용도다.
 
 ### 미수행
 
-- `KUBECONFIG` 지정 후 `kubectl apply --dry-run=client` 재실행
 - `.github/workflows/docker-build.yml` 작성 — 원격 도구로 쓸 수 없는 보호 경로라 수동 생성 필요
 
 ## 미수행
 
 - UNIT-07 운영 반영 (사람 수행)
 - `.github/workflows/docker-build.yml` 작성
-- `KUBECONFIG` 지정 후 manifest dry-run 재검증
 - read-only 권한 계정 발급 (사람 수행)
 - **read-only 동작의 실제 거부 확인** — 모든 쿼리가 `select`라 UNIT-03·04에서도
   확인 기회가 없었다. UNIT-07 운영 반영 시 사람이 확인한다
