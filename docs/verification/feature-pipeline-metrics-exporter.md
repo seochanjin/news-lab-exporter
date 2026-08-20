@@ -802,15 +802,86 @@ Notes:
 
 ### 미수행
 
-- Grafana 패널 추가 (`news-lab` 저장소의 별도 Task)
+- ~~Grafana 패널 추가~~ → UNIT-08에서 완료 (`news-lab` 저장소)
 - 신선도·부분 실패 알림 규칙 (`news-lab` 저장소)
 - 코드 레벨 read-only 단독 검증 (②번 Notes 참조)
+
+
+## UNIT-08. Grafana 대시보드 (`news-lab` 저장소)
+
+### 구현 범위
+
+- `k8s/monitoring/dashboards/news-lab-business-metrics.json` 신규 (15 panel)
+- `k8s/monitoring/dashboards/kustomization.yaml`에 ConfigMap generator 추가
+
+### 설계 판단
+
+**기존 `news-lab-pipeline-operations` 대시보드를 수정하지 않았다.**
+그 대시보드의 설계 문서에 "DB datasource, 가짜 PromQL, exporter를 추가하지 않는다"는
+규칙이 있다. 인프라 지표(kube-state-metrics, node-exporter)와 업무 지표(exporter)는
+출처가 다르므로 ConfigMap도 분리했다. 한쪽 JSON이 깨져도 다른 쪽은 살아 있다.
+
+`stat` panel만 사용했다. Prometheus retention이 1d라서 추세 그래프는 아직 신뢰할 수 없다.
+retention을 늘린 뒤 timeseries panel을 추가한다.
+
+### 발견 — 계열별 임계값 (수정함)
+
+신선도 panel의 임계값을 전 계열에 동일하게(26h 주의 / 48h 위험) 적용했더니
+`weekly`가 3.59일에서 빨간색으로 표시됐다. weekly는 7일 주기이므로 정상 상태다.
+
+**거짓 경보는 진짜 경보를 죽인다.** "weekly는 원래 빨간색"으로 학습되면
+weekly가 실제로 2주째 실패해도 눈에 들어오지 않는다. 이는 이 exporter의 목적
+(조용한 실패를 드러내기)과 정반대다.
+
+`fieldConfig.overrides`에 `byName: weekly` matcher로 별도 임계값을 걸었다.
+7.5일(648000s) 주의 / 10일(864000s) 위험.
+
+```
+수정 전: weekly 3.59 days (빨강)
+수정 후: weekly 3.59 days (초록)
+```
+
+Status: passed
+
+### 화면 확인 결과 (실측)
+
+| 항목 | 값 |
+|---|---|
+| 신선도 | extraction 9.73h / rss_collector 11.7h / three_day 9.66h / weekly 3.59d — 전부 초록 |
+| 실행 누적 | extraction·success 299, rss_collector·success 84, three_day·success 37, three_day·partial_success 23, weekly·success 9, weekly·partial_success 2 |
+| 부분 실패 비율 | three_day 38.3%, weekly 18.2% |
+| 토픽 저장 실패 누적 | three_day 26, weekly 3 |
+| 토픽 저장 성공률 | three_day 91.3%, weekly 93.8% |
+| 원문 추출 실패 항목 | 58 |
+| 저장된 기사 | 11.2K |
+| 중복 차단 누적 | 4.63K |
+| 임베딩 커버리지 | 75.9% |
+| 임베딩 재사용률 | three_day 97.0%, weekly 82.8% |
+| 쿼리 성공 여부 | 7개 전부 OK |
+
+Status: passed — 15 panel 전부 값을 냈다. `No data` 없음.
+
+### 이 화면이 증명한 것
+
+- **three_day는 3회 중 1회 이상(38.3%)이 부분 실패로 끝나는데 Job exit code는 0이다.**
+  조사 시점 34.7%에서 상승했다. 이 값은 exporter 이전에는 어디에도 나타나지 않았다.
+- **extraction은 실행 299회가 전부 `success`인데 실패 항목이 58개다.**
+  실행 단위 상태와 항목 단위 상태가 일치하지 않는다. `items_failed_total`을
+  별도 지표로 분리한 판단이 화면에서 증명됐다.
+- 임베딩 재사용률을 파이프라인별로 처음 분리해 봤다. three_day 97.0% vs weekly 82.8%.
+  weekly가 7일치를 수집해 신규 기사 비중이 높아서라는 **가설이며 아직 확인하지 않았다.**
+
+### 미수행
+
+- Prometheus retention 연장 (1d → 15d, PVC 필요) — 추세 panel의 선행 조건
+- 신선도·부분 실패 알림 규칙
+- 미사용 지표 3개 (`articles_collected_total`, `embedding_missing_total`, `items_processed_total`)
 
 ## 남은 작업
 
 이 Task 범위 밖이거나 다른 저장소의 작업이다.
 
-- Grafana 패널 추가 (`news-lab` 저장소)
+- ~~Grafana 패널 추가~~ → UNIT-08에서 완료
 - 신선도·부분 실패 알림 규칙 (`news-lab` 저장소)
 - 코드 레벨 read-only 단독 검증 — 권한 레벨이 먼저 막아 분리 검증되지 않았다
 - `Collect()` 통합 테스트와 나머지 collect 함수 테스트
@@ -826,4 +897,4 @@ Notes:
 - Supabase에서 read-only 역할 발급 및 Secret 생성
 - 운영 K3s 적용, 이미지 push
 - Prometheus target `UP` 확인
-- Grafana 패널 추가 (`news-lab` 저장소의 별도 Task)
+- ~~Grafana 패널 추가~~ → UNIT-08에서 완료 (`news-lab` 저장소)
